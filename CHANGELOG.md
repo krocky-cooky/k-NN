@@ -6,9 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased 3.6](https://github.com/opensearch-project/k-NN/compare/main...HEAD)
 ### Features
-* Support Lucene BBQ Flat for 1 bit [#3154](https://github.com/opensearch-project/k-NN/pull/3154)
+* Support Lucene SQ Flat for 1 bit [#3154](https://github.com/opensearch-project/k-NN/pull/3154)
 * Add 32x support for SQ encoder on Faiss [#3193](https://github.com/opensearch-project/k-NN/pull/3193)
 * Faiss SQ 1bit MOS changes [#3182](https://github.com/opensearch-project/k-NN/pull/3182)
+* Support compression to 1 bit for Lucene's scalar quantizer [#3144](https://github.com/opensearch-project/k-NN/pull/3144)
 
 ### Maintenance
 * Improve unit tests by tightening asserts [#3112](https://github.com/opensearch-project/k-NN/pull/3112)
@@ -25,14 +26,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 * Fix FaissIdMap honor the given acceptOrds for sparse case. [#3196](https://github.com/opensearch-project/k-NN/pull/3196)
 * Fix radial search bug returning 0 results for IndexHNSWCagra [#3201](https://github.com/opensearch-project/k-NN/pull/3201)
 * Fix copy_to functionality with vector fields [#3162](https://github.com/opensearch-project/k-NN/pull/3162)
+* Fix default encoder to SQ 1 bit for faiss 32x compression [#3210](https://github.com/opensearch-project/k-NN/pull/3210)
+* Implement HasIndexSlice interface in FaissScorableByteVectorValues to support prefetch optimization [#3240](https://github.com/opensearch-project/k-NN/pull/3240)
 
 ### Refactoring
+* Refactor ExactSearcher to use VectorScorer instead of ExactKNNIterator [#3207](https://github.com/opensearch-project/k-NN/pull/3207)
 
 ### Enhancements
 * Make Merge in nativeEngine can Abort [#2529](https://github.com/opensearch-project/k-NN/pull/2529)
 * Use pre-quantized vectors from native engines for exact search [#3095](https://github.com/opensearch-project/k-NN/pull/3095)
 * Use right Vector Scorer when segments are initialized using SPI and also corrected the maxConn for MOS [#3117](https://github.com/opensearch-project/k-NN/pull/3117)
 * Use pre-quantized vectors for ADC [#3113](https://github.com/opensearch-project/k-NN/pull/3113)
+* Adjusting the merge policy setting to make merges less aggressive [#3128](https://github.com/opensearch-project/k-NN/pull/3128)
 * Upgrade Lucene to 10.4.0 [#3135](https://github.com/opensearch-project/k-NN/pull/3135)
 * Speedup FP16 bulk similarity by precomputing the tail mask [#3172](https://github.com/opensearch-project/k-NN/pull/3172)
 * Add Prefetch functionality to prefetch vectors during ANN Search for MemoryOptimizedSearch. [#3173](https://github.com/opensearch-project/k-NN/pull/3173)
@@ -42,4 +47,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 * Add VectorScorers for BinaryDocValues and nested best child scoring [#3179](https://github.com/opensearch-project/k-NN/pull/3179)
 * Introduce NativeEngines990KnnVectorsScorer to decouple native SIMD scoring selection from FaissMemoryOptimizedSearcher [#3184](https://github.com/opensearch-project/k-NN/pull/3184)
 * Add scorer-aware ByteVectorValues wrapper for FAISS Index [#3192](https://github.com/opensearch-project/k-NN/pull/3192)
+* Add Hamming distance scorer for byte vectors in VectorScorers [#3214](https://github.com/opensearch-project/k-NN/pull/3214)
 * Introduce VectorScorers to create VectorScorer instances based on the underlying vector storage format [#3183](https://github.com/opensearch-project/k-NN/pull/3183)

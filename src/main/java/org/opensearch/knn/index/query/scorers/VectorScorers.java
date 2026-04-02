@@ -13,10 +13,12 @@ import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
+import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
+import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
 import org.opensearch.common.Nullable;
 import org.opensearch.knn.common.FieldInfoExtractor;
 import org.opensearch.knn.index.SpaceType;
@@ -25,6 +27,8 @@ import org.opensearch.knn.index.vectorvalues.KNNVectorValuesIterator;
 import org.opensearch.knn.memoryoptsearch.faiss.FlatVectorsScorerProvider;
 
 import java.io.IOException;
+
+import static org.opensearch.knn.index.query.MemoryOptimizedSearchScoreConverter.convertInnerProductScoreToCosineScore;
 
 /**
  * Static factory for creating {@link VectorScorer} instances from {@link KNNVectorValuesIterator.DocIdsIteratorValues}.
@@ -99,6 +103,7 @@ public final class VectorScorers {
      * @param target    the byte query vector
      * @param vectorScorerMode determines whether to use scoring or rescoring
      * @param spaceType the space type defining the similarity function
+     * @param fieldInfo the field info for the vector field
      * @return a {@link VectorScorer} appropriate for the underlying vector storage format
      * @throws IOException if an I/O error occurs
      */
@@ -106,9 +111,10 @@ public final class VectorScorers {
         final KNNVectorValuesIterator.DocIdsIteratorValues docIdsIteratorValues,
         final byte[] target,
         final VectorScorerMode vectorScorerMode,
-        final SpaceType spaceType
+        final SpaceType spaceType,
+        final FieldInfo fieldInfo
     ) throws IOException {
-        return createScorer(docIdsIteratorValues, target, vectorScorerMode, spaceType, null, null);
+        return createScorer(docIdsIteratorValues, target, vectorScorerMode, spaceType, fieldInfo, null, null);
     }
 
     /**
@@ -120,6 +126,7 @@ public final class VectorScorers {
      * @param target    the byte query vector
      * @param vectorScorerMode determines whether to use scoring or rescoring
      * @param spaceType the space type defining the similarity function
+     * @param fieldInfo the field info for the vector field
      * @param acceptedChildrenIterator iterator over accepted child documents, or null if not nested
      * @param parentBitSet bit set identifying parent documents, or null if not nested
      * @return a {@link VectorScorer} appropriate for the underlying vector storage format
@@ -130,10 +137,11 @@ public final class VectorScorers {
         final byte[] target,
         final VectorScorerMode vectorScorerMode,
         final SpaceType spaceType,
+        final FieldInfo fieldInfo,
         @Nullable final DocIdSetIterator acceptedChildrenIterator,
         @Nullable final BitSet parentBitSet
     ) throws IOException {
-        final VectorScorer scorer = getBaseScorer(docIdsIteratorValues, target, vectorScorerMode, spaceType);
+        final VectorScorer scorer = getBaseScorer(docIdsIteratorValues, target, vectorScorerMode, spaceType, fieldInfo);
         return maybeWrapWithNestedScorer(scorer, acceptedChildrenIterator, parentBitSet);
     }
 
@@ -165,7 +173,8 @@ public final class VectorScorers {
         final KNNVectorValuesIterator.DocIdsIteratorValues docIdsIteratorValues,
         final byte[] target,
         final VectorScorerMode vectorScorerMode,
-        final SpaceType spaceType
+        final SpaceType spaceType,
+        final FieldInfo fieldInfo
     ) throws IOException {
         final DocIdSetIterator docIdSetIterator = docIdsIteratorValues.getDocIdSetIterator();
 
@@ -176,7 +185,9 @@ public final class VectorScorers {
 
         final KnnVectorValues knnVectorValues = docIdsIteratorValues.getKnnVectorValues();
         if (knnVectorValues instanceof ByteVectorValues byteVectorValues) {
-            return vectorScorerMode.createScorer(byteVectorValues, target);
+            return spaceType == SpaceType.HAMMING
+                ? createHammingDistanceScorer(fieldInfo, byteVectorValues, target, spaceType)
+                : vectorScorerMode.createScorer(byteVectorValues, target);
         }
         throw new IllegalArgumentException("Byte target requires ByteVectorValues but got " + knnVectorValues.getClass().getSimpleName());
     }
@@ -207,11 +218,17 @@ public final class VectorScorers {
     ) throws IOException {
         // We don't need to delegate since we know it is already ADC.
         // This will be removed once ADC Scorer is integrated into the reader.
-        final FlatVectorsScorer adcFlatVectorsScorer = FlatVectorsScorerProvider.getFlatVectorsScorer(
+        FlatVectorsScorer adcFlatVectorsScorer = FlatVectorsScorerProvider.getFlatVectorsScorer(
             fieldInfo,
             spaceType.getKnnVectorSimilarityFunction(),
             null
         );
+        // For COSINESIMIL, the ADCFlatVectorsScorer produces scores in INNER_PRODUCT format
+        // (used by MemoryOptimizedKNNWeight which post-converts via convertToCosineScore).
+        // In the exact search path there is no post-conversion, so we wrap the scorer to convert here.
+        if (spaceType == SpaceType.COSINESIMIL) {
+            adcFlatVectorsScorer = new CosineADCFlatVectorsScorer(adcFlatVectorsScorer);
+        }
         PrefetchableFlatVectorScorer scorer = new PrefetchableFlatVectorScorer(adcFlatVectorsScorer);
         final RandomVectorScorer randomVectorScorer = scorer.getRandomVectorScorer(
             spaceType.getKnnVectorSimilarityFunction().getVectorSimilarityFunction(),
@@ -223,7 +240,106 @@ public final class VectorScorers {
 
             @Override
             public float score() throws IOException {
-                return randomVectorScorer.score(iterator.docID());
+                return randomVectorScorer.score(iterator.index());
+            }
+
+            @Override
+            public DocIdSetIterator iterator() {
+                return iterator;
+            }
+
+            @Override
+            public Bulk bulk(final DocIdSetIterator matchingDocs) {
+                return Bulk.fromRandomScorerSparse(randomVectorScorer, iterator, matchingDocs);
+            }
+        };
+    }
+
+    /**
+     * Wraps an ADC {@link FlatVectorsScorer} to convert INNER_PRODUCT-format scores to
+     * COSINESIMIL-format. The ADCFlatVectorsScorer uses INNER_PRODUCT.scoreTranslation for
+     * cosine, which the MemoryOptimized path post-converts. In the exact search path there
+     * is no post-conversion, so this wrapper applies it at the scorer level.
+     */
+    // TODO: Move this cosine score conversion into ADCFlatVectorsScorer itself so that it directly
+    // produces COSINESIMIL-format scores. This would eliminate the need for both this wrapper and
+    // the post-conversion in MemoryOptimizedKNNWeight (convertToCosineScore), keeping the
+    // conversion logic in a single place.
+    private record CosineADCFlatVectorsScorer(FlatVectorsScorer delegate) implements FlatVectorsScorer {
+
+        @Override
+        public RandomVectorScorerSupplier getRandomVectorScorerSupplier(
+            VectorSimilarityFunction similarityFunction,
+            KnnVectorValues vectorValues
+        ) throws IOException {
+            return delegate.getRandomVectorScorerSupplier(similarityFunction, vectorValues);
+        }
+
+        @Override
+        public RandomVectorScorer getRandomVectorScorer(
+            VectorSimilarityFunction similarityFunction,
+            KnnVectorValues vectorValues,
+            float[] target
+        ) throws IOException {
+            final RandomVectorScorer inner = delegate.getRandomVectorScorer(similarityFunction, vectorValues, target);
+            return new RandomVectorScorer.AbstractRandomVectorScorer(vectorValues) {
+                @Override
+                public float score(int node) throws IOException {
+                    return convertInnerProductScoreToCosineScore(inner.score(node));
+                }
+            };
+        }
+
+        @Override
+        public RandomVectorScorer getRandomVectorScorer(
+            VectorSimilarityFunction similarityFunction,
+            KnnVectorValues vectorValues,
+            byte[] target
+        ) throws IOException {
+            return delegate.getRandomVectorScorer(similarityFunction, vectorValues, target);
+        }
+    }
+
+    /**
+     * Creates a Hamming distance {@link VectorScorer} that scores a byte query vector
+     * against binary byte document vectors using Hamming distance.
+     *
+     * @param fieldInfo         the field info for the vector field
+     * @param byteVectorValues  the byte vector values from the segment
+     * @param target            the byte query vector
+     * @param spaceType         the space type defining the similarity function
+     * @return a {@link VectorScorer} using Hamming distance scoring
+     * @throws IOException if an I/O error occurs
+     */
+    // TODO: Remove once ByteVectorValues.scorer() is implemented to return the appropriate
+    // VectorScorer based on the distance function. At that point, VectorScorerMode.createScorer()
+    // will handle this case and this method will no longer be needed.
+    private static VectorScorer createHammingDistanceScorer(
+        final FieldInfo fieldInfo,
+        final ByteVectorValues byteVectorValues,
+        final byte[] target,
+        final SpaceType spaceType
+    ) throws IOException {
+        final FlatVectorsScorer hammingFlatVectorsScorer = FlatVectorsScorerProvider.getFlatVectorsScorer(
+            fieldInfo,
+            spaceType.getKnnVectorSimilarityFunction(),
+            null
+        );
+        PrefetchableFlatVectorScorer scorer = new PrefetchableFlatVectorScorer(hammingFlatVectorsScorer);
+        // Hamming's KNNVectorSimilarityFunction does not map to a Lucene VectorSimilarityFunction,
+        // but HammingFlatVectorsScorer ignores this parameter, so we pass EUCLIDEAN as a placeholder.
+        final RandomVectorScorer randomVectorScorer = scorer.getRandomVectorScorer(
+            VectorSimilarityFunction.EUCLIDEAN,
+            byteVectorValues,
+            target
+        );
+
+        return new VectorScorer() {
+            final KnnVectorValues.DocIndexIterator iterator = byteVectorValues.iterator();
+
+            @Override
+            public float score() throws IOException {
+                return randomVectorScorer.score(iterator.index());
             }
 
             @Override
