@@ -5,9 +5,12 @@
 
 package org.opensearch.knn.bwc;
 
-import org.opensearch.Version;
+import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.json.JsonXContent;
+import org.opensearch.Version;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
@@ -16,6 +19,7 @@ import org.opensearch.test.rest.OpenSearchRestTestCase;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Map;
 
 import static org.opensearch.knn.TestUtils.NODES_BWC_CLUSTER;
 import static org.opensearch.knn.common.KNNConstants.FAISS_NAME;
@@ -52,22 +56,29 @@ public class MemoryOptimizedSearchIT extends AbstractRestartUpgradeTestCase {
             // Turn on memory optimized search
             turnOnMemoryOptSearch();
 
-            // Validate warm-up is done without an issue
-            knnWarmup(Collections.singletonList(testIndex));
-
             if (oldVersion.compareTo(Version.V_2_17_0) < 0) {
                 if (engine.equals(NMSLIB_NAME)) {
-                    // Search should work regardless
+                    // NMSLIB does not support memory optimized search, so warmup
+                    // falls back to off-heap loading without hitting the version check.
+                    knnWarmup(Collections.singletonList(testIndex));
                     validateKNNSearch(testIndex, TEST_FIELD, DIMENSION, NUM_DOCS, K);
-
-                    // Memory optimized search is applied, but NMSLIB should load off-heap index.
                     assertEquals(1, getTotalGraphsInCache());
                 } else {
-                    // For FAISS engine, indices created < 2.17 should throw an exception.
+                    // For FAISS engine, indices created before 2.17.0 do not support
+                    // memory optimized search. Warmup should fail with shard failures.
+                    Response warmupResponse = knnWarmup(Collections.singletonList(testIndex));
+                    String responseBody = EntityUtils.toString(warmupResponse.getEntity());
+                    Map<String, Object> responseMap = createParser(
+                        JsonXContent.jsonXContent,
+                        responseBody
+                    ).map();
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> shardsMap = (Map<String, Object>) responseMap.get("_shards");
+                    assertTrue("Expected shard failures during warmup", ((Number) shardsMap.get("failed")).intValue() > 0);
+
+                    // Search should also fail
                     final float[] queryVector = new float[DIMENSION];
                     Arrays.fill(queryVector, (float) NUM_DOCS);
-
-                    // Exception should be thrown
                     assertThrows(
                         ResponseException.class,
                         () -> searchKNNIndex(
@@ -78,7 +89,8 @@ public class MemoryOptimizedSearchIT extends AbstractRestartUpgradeTestCase {
                     );
                 }
             } else {
-                // Validate search, should be fine
+                // Warmup should succeed for indices created on or after 2.17.0
+                knnWarmup(Collections.singletonList(testIndex));
                 validateKNNSearch(testIndex, TEST_FIELD, DIMENSION, NUM_DOCS, K);
 
                 if (engine.equals(NMSLIB_NAME)) {
